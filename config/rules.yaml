@@ -1,0 +1,15 @@
+blocked_domains:
+  - "malware.test"
+  - "badexample.com"
+
+blocked_ips:
+  - "10.10.10.10"
+
+blocked_ports:
+  - 22
+  - 23
+  - 445
+
+blocked_methods:
+  - "TRACE"
+  - "TRACK"
