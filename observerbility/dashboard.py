@@ -1,4 +1,6 @@
 from http.server import HTTPServer, BaseHTTPRequestHandler
+from socketserver import BaseRequestHandler
+
 from observability.metrics import metrics
 from observability.logger import SecurityLogger
 from observability.alerts import AlertManager
@@ -22,7 +24,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
         else:
             self.wfile.write(payload.encode())
 
-    def do_GET(self):
+    def do_get(self):
         if self.path == "/":
             # Serve HTML dashboard
             html = DASHBOARD_HTML
@@ -49,8 +51,8 @@ def raise_dashboard_alert(level, message, context):
     alerts.raise_alert(level, message, context)
 
 def start_dashboard(host="127.0.0.1", port=DASHBOARD_PORT):
-    server = HTTPServer((host, port), DashboardHandler)
-    print(f"[+] Dashboard running on http://{host}:{port}")
+    server = HTTPServer((host, port),[BaseRequestHandler])
+    print(f"[+] Dashboard running on https://{host}:{port}")
     server.serve_forever()
 
 

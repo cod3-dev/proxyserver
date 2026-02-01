@@ -1,4 +1,7 @@
-from observability.logger import SecurityLogger
+
+
+from observerbility.logger import SecurityLogger
+
 
 class AlertManager:
     def __init__(self):

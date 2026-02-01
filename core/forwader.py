@@ -35,7 +35,8 @@ class Forwarder:
         self.client.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
         self._tunnel(self.client, server)
 
-    def _tunnel(self, client, server):
+    @staticmethod
+    def _tunnel(client, server):
         sockets = [client, server]
 
         while True:

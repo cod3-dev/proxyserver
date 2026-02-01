@@ -1,6 +1,6 @@
 import socket
 from core.parser import HTTPParser
-from core.forwarder import Forwarder
+from core.forwarder import forwarder
 
 from security.policy_engine import PolicyEngine
 from observability.logger import SecurityLogger

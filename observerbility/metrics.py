@@ -25,3 +25,7 @@ class Metrics:
             time.sleep(interval)
             stats = self.snapshot()
             print("[METRICS]", stats)
+
+
+def snapshot():
+    return None

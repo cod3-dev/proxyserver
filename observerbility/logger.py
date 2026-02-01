@@ -13,7 +13,7 @@ class SecurityLogger:
 
     def log(self, event_type, data: dict):
         entry = {
-            "timestamp": datetime.utcnow().isoformat(),
+            "timestamp": datetime.now().isoformat(),
             "event": event_type,
             **data
         }
