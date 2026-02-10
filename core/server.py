@@ -1,6 +1,6 @@
 import threading
 from core.listener import ProxyListener
-from observability.api import start_admin_api
+from observability import start_admin_api
 
 
 def main():

@@ -1,7 +1,7 @@
 import unittest
 from security.policy_engine import PolicyEngine
 from security.rules import RULES
-from core.request import ProxyRequests
+from core.request import ProxyRequest
 
 class TestPolicyEngine(unittest.TestCase):
 

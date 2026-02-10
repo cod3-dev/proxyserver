@@ -1,3 +1,4 @@
+from security.decisions import SecurityDecision
 
 from security.rate_limiter import RateLimiter
 from security.reputation import ReputationEngine

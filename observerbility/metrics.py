@@ -27,5 +27,10 @@ class Metrics:
             print("[METRICS]", stats)
 
 
+# Module-level singleton used across the app and expected by tests
+metrics = Metrics()
+
+
 def snapshot():
-    return None
+    """Compatibility helper: return the current metrics snapshot."""
+    return metrics.snapshot()

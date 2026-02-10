@@ -1,17 +1,14 @@
-import socket
 from core.parser import HTTPParser
-from core.forwarder import forwarder
+from core.forwader import Forwarder
 
 from security.policy_engine import PolicyEngine
-from observability.logger import SecurityLogger
-from observability.metrics import Metrics
-from observability.alerts import AlertManager
+from observability import SecurityLogger, metrics, AlertManager
 
 BUFFER_SIZE = 4096
 
 policy = PolicyEngine()
 logger = SecurityLogger()
-metrics = Metrics()
+# metrics is a module-level singleton
 alerts = AlertManager()
 
 
@@ -44,8 +41,8 @@ class ClientConnection:
                 "host": request.host,
                 "port": request.port,
                 "action": decision.action,
-                "reason": decision.reason,
-                "rule": decision.rule_id
+                "reason": getattr(decision, 'reason', None),
+                "code": getattr(decision, 'code', None)
             }
 
             logger.log("REQUEST", log_data)
@@ -68,4 +65,7 @@ class ClientConnection:
 
         except Exception as e:
             print("[ERROR]", e)
-            self.client.close()
+            try:
+                self.client.close()
+            except Exception:
+                pass

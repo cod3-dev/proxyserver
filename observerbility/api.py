@@ -1,6 +1,6 @@
 import json
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from observability.metrics import Metrics
+from observerbility.metrics import metrics
 
 
 class AdminHandler(BaseHTTPRequestHandler):
@@ -11,7 +11,7 @@ class AdminHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(json.dumps(payload, indent=2).encode())
 
-    def do_get(self):
+    def do_GET(self):
         if self.path == "/health":
             self._send(200, {
                 "status": "UP",
@@ -19,7 +19,7 @@ class AdminHandler(BaseHTTPRequestHandler):
             })
 
         elif self.path == "/metrics":
-            self._send(200, Metrics.snapshot())
+            self._send(200, metrics.snapshot())
 
         else:
             self._send(404, {"error": "Not found"})
@@ -30,6 +30,6 @@ class AdminHandler(BaseHTTPRequestHandler):
 
 
 def start_admin_api(host="127.0.0.1", port=9000):
-    server = HTTPServer((host, port, [AdminHandler])
+    server = HTTPServer((host, port), AdminHandler)
     print(f"[+] Admin API running on https://{host}:{port}")
     server.serve_forever()

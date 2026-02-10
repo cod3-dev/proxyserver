@@ -1,0 +1,32 @@
+version: '3.8'
+
+services:
+  controller:
+    build:
+      context: .
+      dockerfile: docker/controller/Dockerfile
+    container_name: proxy_controller
+    ports:
+      - "9100:9100"
+    environment:
+      - PYTHONUNBUFFERED=1
+    volumes:
+      - ./:/app:ro
+
+  node-agent:
+    build:
+      context: ./agents/node-agent
+      dockerfile: Dockerfile
+    container_name: proxy_node_agent
+    ports:
+      - "3128:3128"
+      - "3000:3000"
+    environment:
+      - CONTROL_WS=ws://controller:9100/ws
+      - AGENT_ID=agent-docker
+      - REGION=local-docker
+    depends_on:
+      - controller
+
+# Note: This compose file uses the local Node agent in ./agents/node-agent.
+# If you prefer to run a Python agent or a different implementation, update the 'node-agent' service accordingly.

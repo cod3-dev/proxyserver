@@ -1,20 +1,24 @@
-from http.server import HTTPServer, BaseHTTPRequestHandler
-from socketserver import BaseRequestHandler
 
-from observability.metrics import metrics
-from observability.logger import SecurityLogger
-from observability.alerts import AlertManager
+
+from observerbility.metrics import metrics
+from observerbility.logger import SecurityLogger
+from observerbility.alerts import AlertManager
 import json
+from http.server import HTTPServer
+from http.server import BaseHTTPRequestHandler
+
 
 logger = SecurityLogger()
 alerts = AlertManager()
+# type: ignore
+
 
 DASHBOARD_PORT = 9100
 
 # In-memory alert store for dashboard (latest 50 alerts)
 dashboard_alerts = []
 
-class DashboardHandler(BaseHTTPRequestHandler):
+class DashboardHandler( BaseHTTPRequestHandler):
     def _send(self, code, payload, content_type="application/json"):
         self.send_response(code)
         self.send_header("Content-Type", content_type)
@@ -24,7 +28,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
         else:
             self.wfile.write(payload.encode())
 
-    def do_get(self):
+    def do_GET(self):
         if self.path == "/":
             # Serve HTML dashboard
             html = DASHBOARD_HTML
@@ -38,7 +42,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
         else:
             self._send(404, {"error": "Not found"})
 
-    def log_message(self, format, *args):
+    def log_message(self, fmt, *args):
         return  # silence default logging
 
 def raise_dashboard_alert(level, message, context):
@@ -51,7 +55,7 @@ def raise_dashboard_alert(level, message, context):
     alerts.raise_alert(level, message, context)
 
 def start_dashboard(host="127.0.0.1", port=DASHBOARD_PORT):
-    server = HTTPServer((host, port),[BaseRequestHandler])
+    server = HTTPServer((host, port), DashboardHandler)
     print(f"[+] Dashboard running on https://{host}:{port}")
     server.serve_forever()
 

@@ -1,5 +1,7 @@
 import unittest
-from observability.metrics import metrics
+
+from observerbility.metrics import metrics
+
 
 class TestMetrics(unittest.TestCase):
 
