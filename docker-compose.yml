@@ -10,7 +10,10 @@ services:
       - "9100:9100"
     environment:
       - PYTHONUNBUFFERED=1
+      - CONTROLLER_TLS_CERT=${CONTROLLER_TLS_CERT}
+      - CONTROLLER_TLS_KEY=${CONTROLLER_TLS_KEY}
     volumes:
+      - ./certs:/certs:ro
       - ./:/app:ro
 
   node-agent:
@@ -22,7 +25,8 @@ services:
       - "3128:3128"
       - "3000:3000"
     environment:
-      - CONTROL_WS=ws://controller:9100/ws
+      # Override to `wss://<your-domain>/ws` when the controller is served with a real TLS cert for that hostname.
+      - CONTROL_WS=${CONTROL_WS:-ws://controller:9100/ws}
       - AGENT_ID=agent-docker
       - REGION=local-docker
     depends_on:

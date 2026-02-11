@@ -17,4 +17,4 @@ class SecurityLogger:
             "event": event_type,
             **data
         }
-        self.logger.info(json.dumps(entry))
+        self.logger.info(json.dumps(entry, ensure_ascii=False, default=str))

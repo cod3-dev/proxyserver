@@ -224,6 +224,13 @@ docker compose up --build
 python observerbility/controller.py
 ```
 
+### TLS (Optional)
+Set environment variables to enable HTTPS:
+- Admin API: `ADMIN_TLS_CERT`, `ADMIN_TLS_KEY`
+- Controller: `CONTROLLER_TLS_CERT`, `CONTROLLER_TLS_KEY`
+
+When TLS is enabled, use `https://` for controller endpoints and `wss://` for the WebSocket `/ws` route.
+
 ---
 
 ## 📊 Key Features Implemented
@@ -334,11 +341,11 @@ proxy = ProxyListener(host="0.0.0.0", port=8888)
 - [x] Created entry points (main.py, proxy.py)
 
 ### Recommended Next Steps
-1. **Add TLS/HTTPS support** for admin API and controller (certificates)
-2. **Add authentication** (mTLS or JWT) between controller and agents
-3. **Persist agent registry** to Redis/Postgres (currently in-memory)
-4. **Add agent heartbeat** monitoring and health checks
-5. **Integrate policy_engine** with agents (push rules or query controller)
+1. **Add authentication** (mTLS or JWT) between controller and agents
+2. **Persist agent registry** to Redis/Postgres (currently in-memory)
+3. **Add agent heartbeat** monitoring and health checks
+4. **Integrate policy_engine** with agents (push rules or query controller)
+5. **Add TLS** for the agent admin API and dashboard (cert management)
 6. **Add SOCKS5 support** for agents
 7. **Add Prometheus metrics** format (Prom-compatible `/metrics`)
 8. **Deploy agents** to actual regions (AWS, Azure, GCP)

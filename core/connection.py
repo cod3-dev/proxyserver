@@ -2,7 +2,7 @@ from core.parser import HTTPParser
 from core.forwader import Forwarder
 
 from security.policy_engine import PolicyEngine
-from observability import SecurityLogger, metrics, AlertManager
+from observerbility import SecurityLogger, metrics, AlertManager
 
 BUFFER_SIZE = 4096
 

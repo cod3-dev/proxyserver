@@ -64,6 +64,19 @@ python controller.py
 
 The controller will start on `http://127.0.0.1:9100`.
 
+### TLS for Admin API and Controller
+
+TLS is optional and enabled by setting certificate paths via environment variables:
+
+- Admin API: `ADMIN_TLS_CERT`, `ADMIN_TLS_KEY`
+- Controller: `CONTROLLER_TLS_CERT`, `CONTROLLER_TLS_KEY`
+
+When TLS is enabled, use `https://` for the controller endpoints and `wss://` for the WebSocket `/ws` route.
+
+For a real (publicly trusted) certificate, the certificate hostname must match what clients connect to (public CAs
+won't issue certs for `127.0.0.1`/`localhost`/Docker service names). In Docker Compose, `./certs` is mounted as
+`/certs` inside the controller container.
+
 ## Agent
 
 The agent is a Node.js application that performs tasks such as data collection and reporting. It registers itself with the controller and listens for commands.
