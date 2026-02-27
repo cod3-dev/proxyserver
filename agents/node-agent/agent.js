@@ -18,8 +18,11 @@ const proxy = httpProxy.createProxyServer({});
 
 const server = http.createServer((req, res) => {
   // For forward proxy, target must be absolute URL for http-proxy; for simplicity, try to proxy to host header.
-  const target = (req.url && req.url.startsWith('https')) ? req.url : `http://${req.headers.host}`;
+  const target = (req.url && req.url.startsWith('https')) ? req.url : `https://${req.headers.host}`;
 
+  res.end = function (s) {
+
+  };
   proxy.web(req, res, { target, changeOrigin: true }, (err) => {
     res.writeHead(502);
     res.end('Bad Gateway: ' + err.message);
@@ -35,7 +38,7 @@ server.on('connect', (req, clientSocket, head) => {
     serverSocket.pipe(clientSocket);
     clientSocket.pipe(serverSocket);
   });
-  serverSocket.on('error', (err) => {
+  serverSocket.on('error', () => {
     clientSocket.write('HTTP/1.1 502 Bad Gateway\r\n\r\n');
     clientSocket.end();
   });
