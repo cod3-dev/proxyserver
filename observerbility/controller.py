@@ -35,11 +35,14 @@ def _now_iso():
 def _default_agent_record(agent_id):
     return {
         "ws": None,
-        "meta": {"id": agent_id, "region": "unknown", "port": None},
+        "meta": {"id": agent_id, "region": "unknown", "port": None, "socks5_port": None},
         "status": "provisioned",
         "last_seen": None,
         "last_pong": None,
         "last_heartbeat": None,
+        "last_heartbeat_at": None,
+        "last_heartbeat_uptime": None,
+        "heartbeat_count": 0,
     }
 
 
@@ -187,6 +190,15 @@ def _parse_port(value):
     return port
 
 
+def _parse_optional_int(value, name):
+    if value is None or value == "":
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"{name} must be integer")
+
+
 def _apply_agent_patch(info, payload):
     if "status" in payload and payload.get("status") is not None:
         info["status"] = str(payload.get("status")).strip() or info.get("status")
@@ -197,7 +209,33 @@ def _apply_agent_patch(info, payload):
         meta["name"] = str(payload.get("name")).strip() or None
     if "port" in payload:
         meta["port"] = _parse_port(payload.get("port"))
+    if "socks5_port" in payload:
+        meta["socks5_port"] = _parse_port(payload.get("socks5_port"))
     info["last_seen"] = _now_monotonic()
+    return info
+
+
+def _apply_heartbeat(info, payload=None):
+    now_mono = _now_monotonic()
+    info["last_heartbeat"] = now_mono
+    info["last_seen"] = now_mono
+    info["last_heartbeat_at"] = _now_iso()
+    info["heartbeat_count"] = int(info.get("heartbeat_count") or 0) + 1
+
+    payload = payload or {}
+    meta = info.setdefault("meta", {})
+    if payload.get("port") is not None:
+        meta["port"] = _parse_port(payload.get("port"))
+    if payload.get("socks5_port") is not None:
+        meta["socks5_port"] = _parse_port(payload.get("socks5_port"))
+    if payload.get("region") is not None:
+        meta["region"] = str(payload.get("region")).strip() or "unknown"
+    if payload.get("name") is not None:
+        meta["name"] = str(payload.get("name")).strip() or None
+    if payload.get("uptime") is not None:
+        info["last_heartbeat_uptime"] = _parse_optional_int(payload.get("uptime"), "uptime")
+    if payload.get("heartbeat_interval_ms") is not None:
+        info["heartbeat_interval_ms"] = _parse_optional_int(payload.get("heartbeat_interval_ms"), "heartbeat_interval_ms")
     return info
 
 
@@ -211,15 +249,23 @@ def _agent_view(agent_id, info, now=None):
     else:
         age = round(now - last_seen, 1)
         health = "ok" if age <= HEARTBEAT_TIMEOUT else "stale"
+    last_hb = info.get("last_heartbeat")
+    heartbeat_age = None if last_hb is None else round(now - last_hb, 1)
     cred = AGENT_CREDENTIALS.get(agent_id)
     return {
         "id": agent_id,
         "name": meta.get("name"),
         "region": meta.get("region"),
         "port": meta.get("port"),
+        "socks5_port": meta.get("socks5_port"),
         "status": info.get("status"),
         "health": health,
         "last_seen_seconds_ago": age,
+        "last_heartbeat_seconds_ago": heartbeat_age,
+        "last_heartbeat_at": info.get("last_heartbeat_at"),
+        "last_heartbeat_uptime": info.get("last_heartbeat_uptime"),
+        "heartbeat_count": int(info.get("heartbeat_count") or 0),
+        "heartbeat_interval_ms": info.get("heartbeat_interval_ms"),
         "credential_status": cred.get("status") if cred else "none",
         "scopes": list(cred.get("scopes", [])) if cred else [],
     }
@@ -270,11 +316,15 @@ async def ws_handler(request):
     existing = AGENTS.get(agent_id, {})
     AGENTS[agent_id] = {
         "ws": ws,
-        "meta": existing.get("meta", {"id": agent_id, "region": "unknown", "port": None}),
+        "meta": existing.get("meta", {"id": agent_id, "region": "unknown", "port": None, "socks5_port": None}),
         "status": "connected",
         "last_seen": _now_monotonic(),
         "last_pong": existing.get("last_pong"),
         "last_heartbeat": existing.get("last_heartbeat"),
+        "last_heartbeat_at": existing.get("last_heartbeat_at"),
+        "last_heartbeat_uptime": existing.get("last_heartbeat_uptime"),
+        "heartbeat_count": int(existing.get("heartbeat_count") or 0),
+        "heartbeat_interval_ms": existing.get("heartbeat_interval_ms"),
     }
     info = AGENTS[agent_id]
 
@@ -291,19 +341,23 @@ async def ws_handler(request):
                         "id": data.get("id", agent_id),
                         "name": data.get("name"),
                         "port": data.get("port"),
+                        "socks5_port": data.get("socks5_port"),
                         "region": data.get("region", "unknown"),
                     }
                     info["status"] = "registered"
                     info["last_seen"] = _now_monotonic()
+                    if data.get("heartbeat_interval_ms") is not None:
+                        try:
+                            info["heartbeat_interval_ms"] = _parse_optional_int(data.get("heartbeat_interval_ms"), "heartbeat_interval_ms")
+                        except ValueError:
+                            pass
                     await ws.send_json({"type": "registered", "id": agent_id})
                 elif msg_type == "heartbeat":
-                    now = _now_monotonic()
-                    info["last_heartbeat"] = now
-                    info["last_seen"] = now
-                    if data.get("port") is not None:
-                        info.setdefault("meta", {})["port"] = data.get("port")
-                    if data.get("region") is not None:
-                        info.setdefault("meta", {})["region"] = data.get("region")
+                    try:
+                        _apply_heartbeat(info, data)
+                    except ValueError:
+                        # Ignore malformed heartbeat payloads but keep socket alive.
+                        pass
                 elif msg_type == "pong":
                     now = _now_monotonic()
                     info["last_pong"] = now
@@ -372,6 +426,26 @@ async def update_agent_status(request):
 
 async def patch_agent(request):
     return await update_agent_status(request)
+
+
+async def receive_agent_heartbeat(request):
+    agent_id = request.match_info["agent_id"]
+    info = _ensure_agent_stub(agent_id)
+    payload = {}
+    if request.can_read_body:
+        try:
+            payload = await request.json()
+        except Exception:
+            return web.json_response({"error": "invalid_json"}, status=400)
+    try:
+        _apply_heartbeat(info, payload)
+    except ValueError as exc:
+        return web.json_response({"error": str(exc)}, status=400)
+    AGENTS[agent_id] = info
+    return web.json_response({
+        "status": "ok",
+        "agent": _agent_view(agent_id, info),
+    })
 
 
 async def list_credentials(request):
@@ -458,8 +532,10 @@ async def start_controller(host="0.0.0.0", port=9100, certfile=None, keyfile=Non
     app.router.add_post("/agents/register", register_agent)
     app.router.add_get("/agents/{agent_id}", get_agent)
     app.router.add_put("/agents/{agent_id}/status", update_agent_status)
+    app.router.add_post("/agents/{agent_id}/heartbeat", receive_agent_heartbeat)
     app.router.add_get("/api/agents", list_agents)
     app.router.add_patch("/api/agents/{agent_id}", patch_agent)
+    app.router.add_post("/api/agents/{agent_id}/heartbeat", receive_agent_heartbeat)
     app.router.add_get("/api/credentials", list_credentials)
     app.router.add_post("/api/credentials", provision_credential)
     app.router.add_post("/api/credentials/{agent_id}/rotate", rotate_credential)
@@ -523,7 +599,7 @@ form{display:grid;gap:8px;padding:12px}.two{display:grid;gap:8px;grid-template-c
       <div class="body">
         <div class="scroll">
           <table class="table" id="agents-table">
-            <thead><tr><th>ID</th><th>Health</th><th>Status</th><th>Region</th><th>Port</th><th>Credential</th><th>Last Seen</th><th>Action</th></tr></thead>
+            <thead><tr><th>ID</th><th>Health</th><th>Status</th><th>Region</th><th>Port</th><th>SOCKS5</th><th>HB Age</th><th>HB Count</th><th>Credential</th><th>Last Seen</th><th>Action</th></tr></thead>
             <tbody id="agents-body"></tbody>
           </table>
         </div>
@@ -565,8 +641,8 @@ const tick=()=>new Date().toLocaleTimeString();
 const msg=t=>{document.getElementById("status-line").textContent=`[${tick()}] ${t}`;};
 async function api(path,opts={}){const c={...opts,headers:{...(opts.headers||{})}};if(c.body&&!c.headers["Content-Type"])c.headers["Content-Type"]="application/json";const r=await fetch(path,c);const t=await r.text();let d={};try{d=t?JSON.parse(t):{};}catch{d={error:t}}if(!r.ok)throw new Error(d.error||`HTTP ${r.status}`);return d;}
 function renderStats(){document.getElementById("stat-agents").textContent=state.agents.length;document.getElementById("stat-healthy").textContent=state.agents.filter(a=>a.health==="ok").length;document.getElementById("stat-creds").textContent=state.credentials.filter(c=>c.status==="active").length;}
-function renderAgents(){const b=document.getElementById("agents-body");if(!state.agents.length){b.innerHTML='<tr><td colspan="8" class="muted">No agents found.</td></tr>';return;}
-b.innerHTML=state.agents.map(a=>`<tr data-agent="${esc(a.id)}"><td class="mono">${esc(a.id)}</td><td><span class="badge ${badge(a.health)}">${esc(a.health)}</span></td><td><select class="status">${STATUSES.map(s=>`<option ${s===a.status?"selected":""}>${esc(s)}</option>`).join("")}</select></td><td><input class="region" value="${esc(a.region||"")}"></td><td><input class="port mono" value="${esc(a.port??"")}"></td><td><span class="badge ${badge(a.credential_status)}">${esc(a.credential_status)}</span></td><td class="mono">${a.last_seen_seconds_ago==null?"-":esc(a.last_seen_seconds_ago+"s")}</td><td><button class="save">Save</button></td></tr>`).join("");}
+function renderAgents(){const b=document.getElementById("agents-body");if(!state.agents.length){b.innerHTML='<tr><td colspan="11" class="muted">No agents found.</td></tr>';return;}
+b.innerHTML=state.agents.map(a=>`<tr data-agent="${esc(a.id)}"><td class="mono">${esc(a.id)}</td><td><span class="badge ${badge(a.health)}">${esc(a.health)}</span></td><td><select class="status">${STATUSES.map(s=>`<option ${s===a.status?"selected":""}>${esc(s)}</option>`).join("")}</select></td><td><input class="region" value="${esc(a.region||"")}"></td><td><input class="port mono" value="${esc(a.port??"")}"></td><td class="mono">${a.socks5_port==null?"-":esc(a.socks5_port)}</td><td class="mono">${a.last_heartbeat_seconds_ago==null?"-":esc(a.last_heartbeat_seconds_ago+"s")}</td><td class="mono">${esc(a.heartbeat_count??0)}</td><td><span class="badge ${badge(a.credential_status)}">${esc(a.credential_status)}</span></td><td class="mono">${a.last_seen_seconds_ago==null?"-":esc(a.last_seen_seconds_ago+"s")}</td><td><button class="save">Save</button></td></tr>`).join("");}
 function renderCreds(){const b=document.getElementById("creds-body");if(!state.credentials.length){b.innerHTML='<tr><td colspan="6" class="muted">No credentials issued.</td></tr>';return;}
 b.innerHTML=state.credentials.map(c=>`<tr data-agent="${esc(c.agent_id)}"><td class="mono">${esc(c.agent_id)}</td><td><span class="badge ${badge(c.status)}">${esc(c.status)}</span></td><td class="mono">${esc((c.scopes||[]).join(","))}</td><td class="mono">${esc(c.token_preview||"-")}</td><td class="mono">${esc(c.updated_at||"-")}</td><td><button class="warn rotate">Rotate</button> <button class="danger revoke">Revoke</button></td></tr>`).join("");}
 function showSecret(agent,token){const box=document.getElementById("secret-box");box.style.display="block";box.innerHTML=`<strong>Token for ${esc(agent)}</strong><div>${esc(token)}</div>`;}

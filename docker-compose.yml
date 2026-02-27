@@ -23,12 +23,16 @@ services:
     container_name: proxy_node_agent
     ports:
       - "3128:3128"
+      - "1080:1080"
       - "3000:3000"
     environment:
       # Override to `wss://<your-domain>/ws` when the controller is served with a real TLS cert for that hostname.
       - CONTROL_WS=${CONTROL_WS:-ws://controller:9100/ws}
       - AGENT_ID=agent-docker
       - REGION=local-docker
+      - ADMIN_PORT=${ADMIN_PORT:-3000}
+      - ENABLE_SOCKS5=${ENABLE_SOCKS5:-true}
+      - SOCKS5_PORT=${SOCKS5_PORT:-1080}
     depends_on:
       - controller
 

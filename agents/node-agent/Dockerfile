@@ -3,5 +3,5 @@ WORKDIR /app
 COPY package*.json ./
 RUN npm ci --only=production
 COPY . .
-EXPOSE 3128 3000
+EXPOSE 3128 1080 3000
 CMD ["node", "agent.js"]
