@@ -17,6 +17,7 @@ from typing import Any, Dict, Optional
 from urllib.parse import urlparse
 
 from observerbility.metrics import metrics   # <-- ensure folder name matches
+from security.auth import check_basic_auth, resolve_basic_auth
 
 
 
@@ -58,6 +59,12 @@ class AdminHTTPHandler(BaseHTTPRequestHandler):
 
         self.wfile.write(body)
 
+    def _unauthorized(self) -> None:
+        self.send_response(401)
+        self.send_header("WWW-Authenticate", 'Basic realm="admin-api"')
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
     # -------------------------
     # Endpoints
     # -------------------------
@@ -85,6 +92,18 @@ class AdminHTTPHandler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         path = urlparse(self.path).path
+
+        try:
+            auth_config = resolve_basic_auth("ADMIN")
+        except RuntimeError as exc:
+            logger.error("admin auth config error: %s", exc)
+            self._send_json(500, {"error": "auth_misconfigured"})
+            return
+
+        if auth_config:
+            if not check_basic_auth(self.headers.get("Authorization"), *auth_config):
+                self._unauthorized()
+                return
 
         if path == "/health":
             self._health()

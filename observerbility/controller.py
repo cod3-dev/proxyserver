@@ -1,7 +1,6 @@
 import asyncio
 import json
 import os
-import secrets
 import ssl
 import time
 from datetime import datetime, timezone
@@ -9,10 +8,19 @@ from datetime import datetime, timezone
 from aiohttp import WSMsgType, web
 
 from observerbility.alerts import AlertManager
+from security.agent_tokens import (
+    extract_bearer_token,
+    init_token_store,
+    issue_token,
+    list_token_records,
+    revoke_token,
+    rotate_token,
+    verify_token,
+    get_token_record,
+)
 
 
 AGENTS = {}
-AGENT_CREDENTIALS = {}
 ALERTS = AlertManager()
 
 HEARTBEAT_INTERVAL = 10
@@ -20,8 +28,8 @@ HEARTBEAT_TIMEOUT = 30
 HEARTBEAT_SWEEP_INTERVAL = 5
 FLAP_WINDOW = 120
 FLAP_THRESHOLD = 3
-DEFAULT_SCOPES = ["proxy:connect", "agent:heartbeat"]
 FLAP_STATE = {}
+REGISTER_TIMEOUT = 15
 
 
 def _now_monotonic():
@@ -98,84 +106,16 @@ def _mask_secret(secret):
     return f"{secret[:4]}...{secret[-4:]}"
 
 
-def _normalize_scopes(raw):
-    if raw is None:
-        return list(DEFAULT_SCOPES)
-    if isinstance(raw, str):
-        items = [p.strip() for p in raw.split(",")]
-    elif isinstance(raw, list):
-        items = [str(p).strip() for p in raw]
-    else:
-        raise ValueError("scopes must be list or comma string")
-    out = []
-    seen = set()
-    for item in items:
-        if not item:
-            continue
-        key = item.lower()
-        if key in seen:
-            continue
-        seen.add(key)
-        out.append(item)
-    return out or list(DEFAULT_SCOPES)
-
-
-def _credential_public_view(agent_id, info):
+def _credential_public_view(record):
     return {
-        "agent_id": agent_id,
-        "status": info.get("status", "unknown"),
-        "scopes": list(info.get("scopes", [])),
-        "label": info.get("label"),
-        "created_at": info.get("created_at"),
-        "updated_at": info.get("updated_at"),
-        "revoked_at": info.get("revoked_at"),
-        "token_preview": _mask_secret(info.get("token")),
+        "agent_id": record.get("agent_id"),
+        "status": record.get("status", "unknown"),
+        "subscription_tier": record.get("subscription_tier"),
+        "created_at": record.get("issued_at"),
+        "updated_at": record.get("updated_at"),
+        "expires_at": record.get("expires_at"),
+        "token_preview": _mask_secret(record.get("token")),
     }
-
-
-def _provision_credential(agent_id, scopes, label=None):
-    now = _now_iso()
-    record = {
-        "token": "agt_" + secrets.token_urlsafe(24),
-        "status": "active",
-        "scopes": list(scopes),
-        "label": label,
-        "created_at": now,
-        "updated_at": now,
-        "revoked_at": None,
-    }
-    AGENT_CREDENTIALS[agent_id] = record
-    return record
-
-
-def _rotate_credential(agent_id, scopes=None, label=None):
-    record = AGENT_CREDENTIALS.get(agent_id)
-    if not record:
-        return None
-    now = _now_iso()
-    if scopes is not None:
-        record["scopes"] = list(scopes)
-    if label is not None:
-        record["label"] = label
-    record["token"] = "agt_" + secrets.token_urlsafe(24)
-    record["status"] = "active"
-    record["updated_at"] = now
-    record["revoked_at"] = None
-    AGENT_CREDENTIALS[agent_id] = record
-    return record
-
-
-def _revoke_credential(agent_id):
-    record = AGENT_CREDENTIALS.get(agent_id)
-    if not record:
-        return None
-    now = _now_iso()
-    record["status"] = "revoked"
-    record["token"] = None
-    record["updated_at"] = now
-    record["revoked_at"] = now
-    AGENT_CREDENTIALS[agent_id] = record
-    return record
 
 
 def _parse_port(value):
@@ -251,7 +191,7 @@ def _agent_view(agent_id, info, now=None):
         health = "ok" if age <= HEARTBEAT_TIMEOUT else "stale"
     last_hb = info.get("last_heartbeat")
     heartbeat_age = None if last_hb is None else round(now - last_hb, 1)
-    cred = AGENT_CREDENTIALS.get(agent_id)
+    cred = get_token_record(agent_id)
     return {
         "id": agent_id,
         "name": meta.get("name"),
@@ -267,7 +207,8 @@ def _agent_view(agent_id, info, now=None):
         "heartbeat_count": int(info.get("heartbeat_count") or 0),
         "heartbeat_interval_ms": info.get("heartbeat_interval_ms"),
         "credential_status": cred.get("status") if cred else "none",
-        "scopes": list(cred.get("scopes", [])) if cred else [],
+        "subscription_tier": cred.get("subscription_tier") if cred else None,
+        "token_expires_at": cred.get("expires_at") if cred else None,
     }
 
 
@@ -310,9 +251,14 @@ async def _cleanup_background_tasks(app):
 
 
 async def ws_handler(request):
+    agent_id = request.query.get("id") or f"agent-{len(AGENTS) + 1}"
+    token = extract_bearer_token(request.headers.get("Authorization")) or request.query.get("token")
+    ok, reason = verify_token(agent_id, token)
+    if not ok:
+        return web.json_response({"error": reason}, status=401)
+
     ws = web.WebSocketResponse()
     await ws.prepare(request)
-    agent_id = request.query.get("id") or f"agent-{len(AGENTS) + 1}"
     existing = AGENTS.get(agent_id, {})
     AGENTS[agent_id] = {
         "ws": ws,
@@ -327,6 +273,17 @@ async def ws_handler(request):
         "heartbeat_interval_ms": existing.get("heartbeat_interval_ms"),
     }
     info = AGENTS[agent_id]
+    registered_event = asyncio.Event()
+
+    async def _enforce_registration_timeout():
+        try:
+            await asyncio.wait_for(registered_event.wait(), timeout=REGISTER_TIMEOUT)
+        except asyncio.TimeoutError:
+            info = AGENTS.get(agent_id)
+            if info and info.get("status") != "registered":
+                await _evict_agent(agent_id, info, "registration_timeout")
+
+    timeout_task = asyncio.create_task(_enforce_registration_timeout())
 
     try:
         async for msg in ws:
@@ -351,20 +308,57 @@ async def ws_handler(request):
                             info["heartbeat_interval_ms"] = _parse_optional_int(data.get("heartbeat_interval_ms"), "heartbeat_interval_ms")
                         except ValueError:
                             pass
-                    await ws.send_json({"type": "registered", "id": agent_id})
+                    subscription_tier = data.get("subscription_tier")
+                    existing_record = get_token_record(agent_id)
+                    provided_token = data.get("token")
+                    reuse_ok = False
+                    if provided_token:
+                        reuse_ok, _ = verify_token(agent_id, provided_token)
+                    if reuse_ok and existing_record and (subscription_tier is None or existing_record.get("subscription_tier") == subscription_tier):
+                        token_record = existing_record
+                    else:
+                        token_record = issue_token(agent_id, info["meta"].get("region", "unknown"), subscription_tier)
+                    await ws.send_json({
+                        "type": "registered",
+                        "id": agent_id,
+                        "token": token_record.get("token"),
+                        "subscription_tier": token_record.get("subscription_tier"),
+                        "expires_at": token_record.get("expires_at"),
+                    })
+                    registered_event.set()
                 elif msg_type == "heartbeat":
+                    if info.get("status") != "registered":
+                        await ws.send_json({"type": "error", "error": "not_registered"})
+                        await _evict_agent(agent_id, info, "heartbeat_before_register")
+                        break
+                    ok, reason = verify_token(agent_id, data.get("token"))
+                    if not ok:
+                        await ws.send_json({"type": "error", "error": reason})
+                        await _evict_agent(agent_id, info, "invalid_token")
+                        break
                     try:
                         _apply_heartbeat(info, data)
                     except ValueError:
                         # Ignore malformed heartbeat payloads but keep socket alive.
                         pass
                 elif msg_type == "pong":
+                    if info.get("status") != "registered":
+                        await ws.send_json({"type": "error", "error": "not_registered"})
+                        await _evict_agent(agent_id, info, "pong_before_register")
+                        break
+                    ok, reason = verify_token(agent_id, data.get("token"))
+                    if not ok:
+                        await ws.send_json({"type": "error", "error": reason})
+                        await _evict_agent(agent_id, info, "invalid_token")
+                        break
                     now = _now_monotonic()
                     info["last_pong"] = now
                     info["last_seen"] = now
             elif msg.type == WSMsgType.ERROR:
                 print("ws exception", ws.exception())
     finally:
+        timeout_task.cancel()
+        await asyncio.gather(timeout_task, return_exceptions=True)
         info = AGENTS.get(agent_id)
         if info:
             _record_flap(agent_id, info, info.get("evict_reason", "disconnect"))
@@ -381,22 +375,48 @@ async def list_agents(request):
     return web.json_response([_agent_view(aid, info, now) for aid, info in sorted(AGENTS.items())])
 
 
+def _register_and_issue_token(payload):
+    agent_id = str(payload.get("id") or payload.get("name") or f"agent-{len(AGENTS) + 1}").strip()
+    if not agent_id:
+        raise ValueError("missing_agent_id")
+    info = _ensure_agent_stub(agent_id)
+    _apply_agent_patch(info, payload)
+    info["status"] = "registered"
+    AGENTS[agent_id] = info
+    subscription_tier = payload.get("subscription_tier")
+    region = info.get("meta", {}).get("region") or "unknown"
+    token_record = issue_token(agent_id, region, subscription_tier)
+    response = _agent_view(agent_id, info)
+    response.update({
+        "token": token_record.get("token"),
+        "subscription_tier": token_record.get("subscription_tier"),
+        "token_expires_at": token_record.get("expires_at"),
+    })
+    return response
+
+
 async def register_agent(request):
     try:
         payload = await request.json()
     except Exception:
         return web.json_response({"error": "invalid_json"}, status=400)
-    agent_id = str(payload.get("id") or payload.get("name") or f"agent-{len(AGENTS) + 1}").strip()
-    if not agent_id:
-        return web.json_response({"error": "missing_agent_id"}, status=400)
-    info = _ensure_agent_stub(agent_id)
     try:
-        _apply_agent_patch(info, payload)
+        response = _register_and_issue_token(payload)
     except ValueError as exc:
         return web.json_response({"error": str(exc)}, status=400)
-    info["status"] = "registered"
-    AGENTS[agent_id] = info
-    return web.json_response(_agent_view(agent_id, info), status=201)
+    return web.json_response(response, status=201)
+
+
+async def issue_agent_token(request):
+    try:
+        payload = await request.json()
+    except Exception:
+        return web.json_response({"error": "invalid_json"}, status=400)
+    try:
+        response = _register_and_issue_token(payload)
+    except ValueError as exc:
+        return web.json_response({"error": str(exc)}, status=400)
+    return web.json_response(response, status=201)
 
 
 async def get_agent(request):
@@ -430,13 +450,19 @@ async def patch_agent(request):
 
 async def receive_agent_heartbeat(request):
     agent_id = request.match_info["agent_id"]
-    info = _ensure_agent_stub(agent_id)
+    info = AGENTS.get(agent_id)
+    if not info or info.get("status") != "registered":
+        return web.json_response({"error": "not_registered"}, status=403)
     payload = {}
     if request.can_read_body:
         try:
             payload = await request.json()
         except Exception:
             return web.json_response({"error": "invalid_json"}, status=400)
+    token = extract_bearer_token(request.headers.get("Authorization")) or payload.get("token")
+    ok, reason = verify_token(agent_id, token)
+    if not ok:
+        return web.json_response({"error": reason}, status=403)
     try:
         _apply_heartbeat(info, payload)
     except ValueError as exc:
@@ -449,7 +475,8 @@ async def receive_agent_heartbeat(request):
 
 
 async def list_credentials(request):
-    return web.json_response([_credential_public_view(aid, info) for aid, info in sorted(AGENT_CREDENTIALS.items())])
+    records = list_token_records()
+    return web.json_response([_credential_public_view(record) for record in records])
 
 
 async def provision_credential(request):
@@ -460,47 +487,35 @@ async def provision_credential(request):
     agent_id = str(payload.get("agent_id") or "").strip()
     if not agent_id:
         return web.json_response({"error": "missing_agent_id"}, status=400)
-    try:
-        scopes = _normalize_scopes(payload.get("scopes"))
-    except ValueError as exc:
-        return web.json_response({"error": str(exc)}, status=400)
-    label = payload.get("label")
-    label = str(label).strip() if label is not None else None
-    label = label or None
     _ensure_agent_stub(agent_id)
-    record = _provision_credential(agent_id, scopes, label)
-    return web.json_response({"agent_id": agent_id, "token": record["token"], "credential": _credential_public_view(agent_id, record)}, status=201)
+    subscription_tier = payload.get("subscription_tier") or payload.get("tier")
+    region = payload.get("region") or AGENTS.get(agent_id, {}).get("meta", {}).get("region") or "unknown"
+    record = issue_token(agent_id, region, subscription_tier)
+    return web.json_response({"agent_id": agent_id, "token": record["token"], "credential": _credential_public_view(record)}, status=201)
 
 
 async def rotate_credential(request):
     agent_id = request.match_info["agent_id"]
-    if agent_id not in AGENT_CREDENTIALS:
-        return web.json_response({"error": "not_found"}, status=404)
     payload = {}
     if request.can_read_body:
         try:
             payload = await request.json()
         except Exception:
             return web.json_response({"error": "invalid_json"}, status=400)
-    scopes = None
-    if "scopes" in payload:
-        try:
-            scopes = _normalize_scopes(payload.get("scopes"))
-        except ValueError as exc:
-            return web.json_response({"error": str(exc)}, status=400)
-    label = payload.get("label")
-    label = str(label).strip() if label is not None else None
-    label = label or None
-    record = _rotate_credential(agent_id, scopes=scopes, label=label)
-    return web.json_response({"agent_id": agent_id, "token": record["token"], "credential": _credential_public_view(agent_id, record)})
+    subscription_tier = payload.get("subscription_tier") or payload.get("tier")
+    region = payload.get("region")
+    record = rotate_token(agent_id, region=region, subscription_tier=subscription_tier)
+    if not record:
+        return web.json_response({"error": "not_found"}, status=404)
+    return web.json_response({"agent_id": agent_id, "token": record["token"], "credential": _credential_public_view(record)})
 
 
 async def revoke_credential(request):
     agent_id = request.match_info["agent_id"]
-    record = _revoke_credential(agent_id)
+    record = revoke_token(agent_id)
     if not record:
         return web.json_response({"error": "not_found"}, status=404)
-    return web.json_response(_credential_public_view(agent_id, record))
+    return web.json_response(_credential_public_view(record))
 
 
 async def health(request):
@@ -524,17 +539,20 @@ def _build_ssl_context(certfile, keyfile):
 async def start_controller(host="0.0.0.0", port=9100, certfile=None, keyfile=None):
     certfile, keyfile = _resolve_tls_paths(certfile, keyfile)
     ssl_context = _build_ssl_context(certfile, keyfile)
+    init_token_store()
     app = web.Application()
     app.router.add_get("/", dashboard_ui)
     app.router.add_get("/health", health)
     app.router.add_get("/ws", ws_handler)
     app.router.add_get("/agents", list_agents)
     app.router.add_post("/agents/register", register_agent)
+    app.router.add_post("/agents/token", issue_agent_token)
     app.router.add_get("/agents/{agent_id}", get_agent)
     app.router.add_put("/agents/{agent_id}/status", update_agent_status)
     app.router.add_post("/agents/{agent_id}/heartbeat", receive_agent_heartbeat)
     app.router.add_get("/api/agents", list_agents)
     app.router.add_patch("/api/agents/{agent_id}", patch_agent)
+    app.router.add_post("/api/agents/token", issue_agent_token)
     app.router.add_post("/api/agents/{agent_id}/heartbeat", receive_agent_heartbeat)
     app.router.add_get("/api/credentials", list_credentials)
     app.router.add_post("/api/credentials", provision_credential)
@@ -611,7 +629,7 @@ form{display:grid;gap:8px;padding:12px}.two{display:grid;gap:8px;grid-template-c
         <form id="provision-form">
           <input id="agent-id" placeholder="agent-us-east-1" required>
           <div class="two">
-            <input id="scope-list" placeholder="proxy:connect,agent:heartbeat">
+            <input id="subscription-tier" placeholder="subscription tier (trial/basic/pro)">
             <input id="cred-label" placeholder="label (optional)">
           </div>
           <button type="submit">Provision</button>
@@ -624,7 +642,7 @@ form{display:grid;gap:8px;padding:12px}.two{display:grid;gap:8px;grid-template-c
         <div class="body">
           <div class="scroll">
             <table class="table" id="creds-table">
-              <thead><tr><th>Agent</th><th>Status</th><th>Scopes</th><th>Preview</th><th>Updated</th><th>Action</th></tr></thead>
+              <thead><tr><th>Agent</th><th>Status</th><th>Tier</th><th>Preview</th><th>Updated</th><th>Action</th></tr></thead>
               <tbody id="creds-body"></tbody>
             </table>
           </div>
@@ -644,10 +662,10 @@ function renderStats(){document.getElementById("stat-agents").textContent=state.
 function renderAgents(){const b=document.getElementById("agents-body");if(!state.agents.length){b.innerHTML='<tr><td colspan="11" class="muted">No agents found.</td></tr>';return;}
 b.innerHTML=state.agents.map(a=>`<tr data-agent="${esc(a.id)}"><td class="mono">${esc(a.id)}</td><td><span class="badge ${badge(a.health)}">${esc(a.health)}</span></td><td><select class="status">${STATUSES.map(s=>`<option ${s===a.status?"selected":""}>${esc(s)}</option>`).join("")}</select></td><td><input class="region" value="${esc(a.region||"")}"></td><td><input class="port mono" value="${esc(a.port??"")}"></td><td class="mono">${a.socks5_port==null?"-":esc(a.socks5_port)}</td><td class="mono">${a.last_heartbeat_seconds_ago==null?"-":esc(a.last_heartbeat_seconds_ago+"s")}</td><td class="mono">${esc(a.heartbeat_count??0)}</td><td><span class="badge ${badge(a.credential_status)}">${esc(a.credential_status)}</span></td><td class="mono">${a.last_seen_seconds_ago==null?"-":esc(a.last_seen_seconds_ago+"s")}</td><td><button class="save">Save</button></td></tr>`).join("");}
 function renderCreds(){const b=document.getElementById("creds-body");if(!state.credentials.length){b.innerHTML='<tr><td colspan="6" class="muted">No credentials issued.</td></tr>';return;}
-b.innerHTML=state.credentials.map(c=>`<tr data-agent="${esc(c.agent_id)}"><td class="mono">${esc(c.agent_id)}</td><td><span class="badge ${badge(c.status)}">${esc(c.status)}</span></td><td class="mono">${esc((c.scopes||[]).join(","))}</td><td class="mono">${esc(c.token_preview||"-")}</td><td class="mono">${esc(c.updated_at||"-")}</td><td><button class="warn rotate">Rotate</button> <button class="danger revoke">Revoke</button></td></tr>`).join("");}
+b.innerHTML=state.credentials.map(c=>`<tr data-agent="${esc(c.agent_id)}"><td class="mono">${esc(c.agent_id)}</td><td><span class="badge ${badge(c.status)}">${esc(c.status)}</span></td><td class="mono">${esc(c.subscription_tier||"-")}</td><td class="mono">${esc(c.token_preview||"-")}</td><td class="mono">${esc(c.updated_at||"-")}</td><td><button class="warn rotate">Rotate</button> <button class="danger revoke">Revoke</button></td></tr>`).join("");}
 function showSecret(agent,token){const box=document.getElementById("secret-box");box.style.display="block";box.innerHTML=`<strong>Token for ${esc(agent)}</strong><div>${esc(token)}</div>`;}
 async function refresh(){const [a,c]=await Promise.all([api("/api/agents"),api("/api/credentials")]);state.agents=Array.isArray(a)?a:[];state.credentials=Array.isArray(c)?c:[];renderStats();renderAgents();renderCreds();document.getElementById("agents-refresh").textContent=`updated ${tick()}`;document.getElementById("creds-refresh").textContent=`updated ${tick()}`;}
-document.getElementById("provision-form").addEventListener("submit",async e=>{e.preventDefault();const agent=document.getElementById("agent-id").value.trim();const scopes=document.getElementById("scope-list").value.trim();const label=document.getElementById("cred-label").value.trim();if(!agent){msg("agent id required");return;}const body={agent_id:agent};if(scopes)body.scopes=scopes.split(",").map(x=>x.trim()).filter(Boolean);if(label)body.label=label;try{const r=await api("/api/credentials",{method:"POST",body:JSON.stringify(body)});showSecret(r.agent_id,r.token);msg(`credential provisioned for ${r.agent_id}`);refresh();}catch(err){msg(`error: ${err.message}`);}});
+document.getElementById("provision-form").addEventListener("submit",async e=>{e.preventDefault();const agent=document.getElementById("agent-id").value.trim();const tier=document.getElementById("subscription-tier").value.trim();const label=document.getElementById("cred-label").value.trim();if(!agent){msg("agent id required");return;}const body={agent_id:agent};if(tier)body.subscription_tier=tier;if(label)body.label=label;try{const r=await api("/api/credentials",{method:"POST",body:JSON.stringify(body)});showSecret(r.agent_id,r.token);msg(`credential provisioned for ${r.agent_id}`);refresh();}catch(err){msg(`error: ${err.message}`);}});
 document.getElementById("agents-table").addEventListener("click",async e=>{const b=e.target.closest(".save");if(!b)return;const row=e.target.closest("tr");const agent=row.getAttribute("data-agent");const status=row.querySelector(".status").value;const region=row.querySelector(".region").value.trim()||"unknown";const portText=row.querySelector(".port").value.trim();const port=portText===""?null:Number(portText);if(portText!==""&&Number.isNaN(port)){msg(`invalid port for ${agent}`);return;}try{await api(`/api/agents/${encodeURIComponent(agent)}`,{method:"PATCH",body:JSON.stringify({status,region,port})});msg(`agent ${agent} updated`);refresh();}catch(err){msg(`error: ${err.message}`);}});
 document.getElementById("creds-table").addEventListener("click",async e=>{const row=e.target.closest("tr");if(!row)return;const agent=row.getAttribute("data-agent");
 if(e.target.closest(".rotate")){try{const r=await api(`/api/credentials/${encodeURIComponent(agent)}/rotate`,{method:"POST",body:"{}"});showSecret(r.agent_id,r.token);msg(`credential rotated for ${agent}`);refresh();}catch(err){msg(`error: ${err.message}`);}}

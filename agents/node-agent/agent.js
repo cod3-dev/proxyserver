@@ -3,6 +3,7 @@ const httpProxy = require('http-proxy');
 const WebSocket = require('ws');
 const express = require('express');
 const net = require('net');
+const https = require('https');
 
 const PROXY_PORT = process.env.PROXY_PORT || 3128;
 const ADMIN_PORT = Number(process.env.ADMIN_PORT || 3000);
@@ -12,6 +13,7 @@ const SOCKS5_CONNECT_TIMEOUT_MS = Number(process.env.SOCKS5_CONNECT_TIMEOUT_MS |
 const CONTROL_WS = process.env.CONTROL_WS || 'ws://127.0.0.1:9100/ws';
 const AGENT_ID = process.env.AGENT_ID || `agent-${Math.random().toString(36).slice(2,8)}`;
 const REGION = process.env.REGION || 'unknown';
+const SUBSCRIPTION_TIER = process.env.SUBSCRIPTION_TIER || 'trial';
 const HEARTBEAT_INTERVAL_MS = Number(process.env.HEARTBEAT_INTERVAL_MS || 10000);
 const RECONNECT_BASE_MS = Number(process.env.RECONNECT_BASE_MS || 1000);
 const RECONNECT_MAX_MS = Number(process.env.RECONNECT_MAX_MS || 30000);
@@ -333,6 +335,7 @@ admin.listen(ADMIN_PORT, () => console.log(`Admin API listening on :${ADMIN_PORT
 let ws;
 let heartbeatTimer = null;
 let reconnectDelayMs = RECONNECT_BASE_MS;
+let agentToken = null;
 
 function resetBackoff() {
   reconnectDelayMs = RECONNECT_BASE_MS;
@@ -354,7 +357,7 @@ function sendJson(payload) {
 function startHeartbeat() {
   stopHeartbeat();
   heartbeatTimer = setInterval(() => {
-    sendJson({
+    const payload = {
       type: 'heartbeat',
       id: AGENT_ID,
       port: PROXY_PORT,
@@ -362,7 +365,11 @@ function startHeartbeat() {
       region: REGION,
       uptime: Math.round(process.uptime()),
       heartbeat_interval_ms: HEARTBEAT_INTERVAL_MS
-    });
+    };
+    if (agentToken) {
+      payload.token = agentToken;
+    }
+    sendJson(payload);
   }, HEARTBEAT_INTERVAL_MS);
 }
 
@@ -372,48 +379,161 @@ function stopHeartbeat() {
     heartbeatTimer = null;
   }
 }
-function connectControl() {
-  console.log('Connecting to controller at', CONTROL_WS);
-  ws = new WebSocket(CONTROL_WS + `?id=${AGENT_ID}`);
 
-  ws.on('open', () => {
-    console.log('Control connected');
-    resetBackoff();
-    sendJson({
-      type: 'register',
-      id: AGENT_ID,
-      port: PROXY_PORT,
-      socks5_port: ENABLE_SOCKS5 ? SOCKS5_PORT : null,
-      region: REGION,
-      heartbeat_interval_ms: HEARTBEAT_INTERVAL_MS
-    });
-    startHeartbeat();
-  });
+function buildControllerUrl(pathname) {
+  const url = new URL(CONTROL_WS);
+  url.protocol = url.protocol === 'wss:' ? 'https:' : 'http:';
+  url.pathname = pathname;
+  url.search = '';
+  url.hash = '';
+  return url;
+}
 
-  ws.on('message', (msg) => {
-    try {
-      const data = JSON.parse(msg);
-      if (data.type === 'update-config') {
-        console.log('Received config update', data.config);
-      } else if (data.type === 'ping') {
-        sendJson({ type: 'pong', id: AGENT_ID });
+function requestJson(url, payload) {
+  return new Promise((resolve, reject) => {
+    const body = JSON.stringify(payload);
+    const client = url.protocol === 'https:' ? https : http;
+    const req = client.request(
+      {
+        method: 'POST',
+        hostname: url.hostname,
+        port: url.port || (url.protocol === 'https:' ? 443 : 80),
+        path: url.pathname + url.search,
+        headers: {
+          'Content-Type': 'application/json',
+          'Content-Length': Buffer.byteLength(body)
+        }
+      },
+      (res) => {
+        let data = '';
+        res.on('data', (chunk) => {
+          data += chunk.toString();
+        });
+        res.on('end', () => {
+          if (res.statusCode && res.statusCode >= 200 && res.statusCode < 300) {
+            try {
+              resolve(data ? JSON.parse(data) : {});
+            } catch (err) {
+              reject(new Error('invalid JSON response'));
+            }
+          } else {
+            let msg = data;
+            try {
+              const parsed = JSON.parse(data);
+              msg = parsed.error || data;
+            } catch (err) {
+              msg = data;
+            }
+            reject(new Error(`HTTP ${res.statusCode}: ${msg}`));
+          }
+        });
       }
-    } catch (e) {
-      console.error('Invalid WS message', e.message);
+    );
+    req.on('error', reject);
+    req.write(body);
+    req.end();
+  });
+}
+
+async function registerAgent() {
+  const url = buildControllerUrl('/agents/token');
+  const payload = {
+    id: AGENT_ID,
+    port: PROXY_PORT,
+    socks5_port: ENABLE_SOCKS5 ? SOCKS5_PORT : null,
+    region: REGION,
+    subscription_tier: SUBSCRIPTION_TIER,
+    heartbeat_interval_ms: HEARTBEAT_INTERVAL_MS
+  };
+  const response = await requestJson(url, payload);
+  if (!response.token) {
+    throw new Error('registration did not return token');
+  }
+  agentToken = response.token;
+}
+function connectControl() {
+  const start = async () => {
+    if (!agentToken) {
+      try {
+        console.log('Registering agent before websocket connect');
+        await registerAgent();
+      } catch (err) {
+        console.error('Registration failed', err.message);
+        const delay = nextReconnectDelay();
+        console.log(`Retrying registration in ${Math.round(delay / 1000)}s`);
+        setTimeout(connectControl, delay);
+        return;
+      }
     }
-  });
 
-  ws.on('close', () => {
-    stopHeartbeat();
-    const delay = nextReconnectDelay();
-    console.log(`Control disconnected, reconnecting in ${Math.round(delay / 1000)}s`);
-    setTimeout(connectControl, delay);
-  });
+    const wsUrl = new URL(CONTROL_WS);
+    wsUrl.searchParams.set('id', AGENT_ID);
+    if (agentToken) {
+      wsUrl.searchParams.set('token', agentToken);
+    }
+    console.log('Connecting to controller at', wsUrl.toString());
+    ws = new WebSocket(wsUrl.toString());
 
-  ws.on('error', (e) => {
-    console.error('Control socket error', e.message);
-    ws.close();
-  });
+    ws.on('unexpected-response', (req, res) => {
+      if (res.statusCode === 401 || res.statusCode === 403) {
+        console.error('WebSocket auth failed, re-registering');
+        agentToken = null;
+      }
+    });
+
+    ws.on('open', () => {
+      console.log('Control connected');
+      resetBackoff();
+      const payload = {
+        type: 'register',
+        id: AGENT_ID,
+        port: PROXY_PORT,
+        socks5_port: ENABLE_SOCKS5 ? SOCKS5_PORT : null,
+        region: REGION,
+        subscription_tier: SUBSCRIPTION_TIER,
+        heartbeat_interval_ms: HEARTBEAT_INTERVAL_MS
+      };
+      if (agentToken) {
+        payload.token = agentToken;
+      }
+      sendJson(payload);
+      startHeartbeat();
+    });
+
+    ws.on('message', (msg) => {
+      try {
+        const data = JSON.parse(msg);
+        if (data.type === 'update-config') {
+          console.log('Received config update', data.config);
+        } else if (data.type === 'registered' && data.token) {
+          agentToken = data.token;
+          console.log('Received agent token');
+        } else if (data.type === 'ping') {
+          const payload = { type: 'pong', id: AGENT_ID };
+          if (agentToken) {
+            payload.token = agentToken;
+          }
+          sendJson(payload);
+        }
+      } catch (e) {
+        console.error('Invalid WS message', e.message);
+      }
+    });
+
+    ws.on('close', () => {
+      stopHeartbeat();
+      const delay = nextReconnectDelay();
+      console.log(`Control disconnected, reconnecting in ${Math.round(delay / 1000)}s`);
+      setTimeout(connectControl, delay);
+    });
+
+    ws.on('error', (e) => {
+      console.error('Control socket error', e.message);
+      ws.close();
+    });
+  };
+
+  start();
 }
 
 connectControl();

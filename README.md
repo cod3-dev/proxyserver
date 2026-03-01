@@ -77,6 +77,49 @@ For a real (publicly trusted) certificate, the certificate hostname must match w
 won't issue certs for `127.0.0.1`/`localhost`/Docker service names). In Docker Compose, `./certs` is mounted as
 `/certs` inside the controller container.
 
+### Authentication
+
+The proxy and admin API support HTTP Basic authentication via environment variables.
+
+Proxy authentication uses the `Proxy-Authorization` header and returns `407 Proxy Authentication Required` when
+credentials are missing or invalid.
+
+```bash
+# Enable proxy authentication
+export PROXY_AUTH_USERNAME=proxyuser
+export PROXY_AUTH_PASSWORD=proxypass
+export PROXY_AUTH_ENABLED=true
+
+# Example curl through the proxy
+curl -x http://127.0.0.1:8888 -U proxyuser:proxypass https://example.com
+```
+
+Admin API authentication uses the `Authorization` header and returns `401 Unauthorized` when credentials are
+missing or invalid.
+
+```bash
+# Enable admin API authentication
+export ADMIN_AUTH_USERNAME=admin
+export ADMIN_AUTH_PASSWORD=changeme
+export ADMIN_AUTH_ENABLED=true
+
+# Example admin API call
+curl -u admin:changeme http://127.0.0.1:9000/metrics
+```
+
+Dashboard authentication uses the `Authorization` header and returns `401 Unauthorized` when credentials are
+missing or invalid.
+
+```bash
+# Enable dashboard authentication
+export DASHBOARD_AUTH_USERNAME=dashboard
+export DASHBOARD_AUTH_PASSWORD=changeme
+export DASHBOARD_AUTH_ENABLED=true
+
+# Example dashboard call
+curl -u dashboard:changeme http://127.0.0.1:9100/health
+```
+
 ## Agent
 
 The agent is a Node.js application that performs tasks such as data collection and reporting. It registers itself with the controller and listens for commands.
@@ -100,6 +143,7 @@ The agent will register with the controller and start listening on the configure
 ### Controller API
 
 - `POST /agents/register`: Register a new agent.
+- `POST /agents/token`: Register (if needed) and issue a JWT for an agent.
 - `GET /agents`: List all registered agents.
 - `GET /agents/{id}`: Get details of a specific agent.
 - `PUT /agents/{id}/status`: Update the status of an agent.
@@ -115,10 +159,10 @@ The agent will register with the controller and start listening on the configure
 To test the PoC, follow these steps:
 
 1. Start the controller and agent using Docker Compose (see above instructions).
-2. Register a new agent using the controller API:
+2. Register a new agent and issue a JWT using the controller API:
 
    ```bash
-   curl -X POST http://127.0.0.1:9100/agents/register -d '{"name": "Agent1"}' -H "Content-Type: application/json"
+   curl -X POST http://127.0.0.1:9100/agents/token -d '{"name": "Agent1"}' -H "Content-Type: application/json"
    ```
 
 3. Submit a new task to the agent:

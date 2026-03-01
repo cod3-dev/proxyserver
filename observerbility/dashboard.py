@@ -22,6 +22,8 @@ from urllib.parse import urlparse
 
 from observerbility.metrics import metrics
 from observerbility.alerts import AlertManager
+from security.regions import load_region_policy, update_region_enabled
+from security.auth import check_basic_auth, resolve_basic_auth
 
 
 # =========================================================
@@ -82,12 +84,30 @@ class DashboardHandler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError):
             return
 
+    def _unauthorized(self) -> None:
+        self.send_response(401)
+        self.send_header("WWW-Authenticate", 'Basic realm="dashboard"')
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
     # -------------------------
     # routes
     # -------------------------
 
     def do_GET(self) -> None:
         path = urlparse(self.path).path
+
+        try:
+            auth_config = resolve_basic_auth("DASHBOARD")
+        except RuntimeError as exc:
+            print(f"[ERROR] dashboard auth config error: {exc}")
+            self._send_json(500, {"error": "auth_misconfigured"})
+            return
+
+        if auth_config:
+            if not check_basic_auth(self.headers.get("Authorization"), *auth_config):
+                self._unauthorized()
+                return
 
         if path == "/":
             self._send_html(DASHBOARD_HTML)
@@ -102,8 +122,68 @@ class DashboardHandler(BaseHTTPRequestHandler):
         elif path == "/health":
             self._send_json(200, {"status": "UP", "service": "Security Proxy"})
 
+        elif path == "/regions":
+            policy = load_region_policy()
+            payload = {
+                "default_action": policy.default_action,
+                "regions": [
+                    {
+                        "name": region.name,
+                        "client_cidrs": region.client_cidrs,
+                        "allow_domains": region.allow_domains,
+                        "allow_cidrs": region.allow_cidrs,
+                        "enabled": region.enabled,
+                    }
+                    for region in policy.regions
+                ],
+            }
+            self._send_json(200, payload)
+
         else:
             self._send_json(404, {"error": "not_found"})
+
+    def do_POST(self) -> None:
+        path = urlparse(self.path).path
+
+        try:
+            auth_config = resolve_basic_auth("DASHBOARD")
+        except RuntimeError as exc:
+            print(f"[ERROR] dashboard auth config error: {exc}")
+            self._send_json(500, {"error": "auth_misconfigured"})
+            return
+
+        if auth_config:
+            if not check_basic_auth(self.headers.get("Authorization"), *auth_config):
+                self._unauthorized()
+                return
+
+        if path == "/regions/activate":
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+            except ValueError:
+                length = 0
+
+            raw = self.rfile.read(length) if length > 0 else b"{}"
+            try:
+                payload = json.loads(raw.decode() or "{}")
+            except json.JSONDecodeError:
+                self._send_json(400, {"error": "invalid_json"})
+                return
+
+            name = str(payload.get("name", "")).strip()
+            enabled = bool(payload.get("enabled", False))
+            if not name:
+                self._send_json(400, {"error": "missing_name"})
+                return
+
+            if not update_region_enabled(name, enabled):
+                self._send_json(404, {"error": "region_not_found"})
+                return
+
+            self._send_json(200, {"status": "ok", "name": name, "enabled": enabled})
+            return
+
+        self._send_json(404, {"error": "not_found"})
 
     def log_message(self, *args: Any) -> None:
         return  # silence default http logs
@@ -221,15 +301,67 @@ pre { white-space:pre-wrap }
     <h3>Alerts</h3>
     <pre id="alerts">Loading...</pre>
   </div>
+
+  <div class="card">
+    <h3>Regions</h3>
+    <label>
+      <input type="checkbox" id="showAllRegions" checked />
+      Show all countries
+    </label>
+    <div id="regionList">Loading...</div>
+    <pre id="regions">Loading...</pre>
+  </div>
 </div>
 
 <script>
+function renderRegionList(regions) {
+    const list = document.getElementById('regionList');
+    list.innerHTML = '';
+
+    regions.forEach((region) => {
+        const row = document.createElement('div');
+        const label = document.createElement('label');
+        label.style.display = 'block';
+
+        const checkbox = document.createElement('input');
+        checkbox.type = 'checkbox';
+        checkbox.checked = !!region.enabled;
+        checkbox.addEventListener('change', async () => {
+            await fetch('/regions/activate', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ name: region.name, enabled: checkbox.checked })
+            });
+            refresh();
+        });
+
+        label.appendChild(checkbox);
+        label.appendChild(document.createTextNode(' ' + region.name));
+        row.appendChild(label);
+        list.appendChild(row);
+    });
+}
+
 async function refresh(){
     const m = await fetch('/metrics').then(r=>r.json());
     const a = await fetch('/alerts').then(r=>r.json());
+    const r = await fetch('/regions').then(r=>r.json());
 
     document.getElementById('metrics').textContent = JSON.stringify(m,null,2);
     document.getElementById('alerts').textContent = JSON.stringify(a,null,2);
+
+    const showAll = document.getElementById('showAllRegions').checked;
+    const regions = (r.regions || []).filter((region) => {
+        if (showAll) return true;
+        return (region.client_cidrs || []).length ||
+               (region.allow_domains || []).length ||
+               (region.allow_cidrs || []).length;
+    });
+    renderRegionList(regions);
+    document.getElementById('regions').textContent = JSON.stringify({
+        default_action: r.default_action,
+        regions: regions
+    }, null, 2);
 }
 
 setInterval(refresh, 2000);

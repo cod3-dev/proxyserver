@@ -3,6 +3,7 @@ from security.decisions import SecurityDecision
 from security.rate_limiter import RateLimiter
 from security.reputation import ReputationEngine
 from security.detector import ThreatDetector
+from security.regions import is_destination_allowed
 
 
 class PolicyEngine:
@@ -18,6 +19,10 @@ class PolicyEngine:
         # 1. Rate limiting
         if not self.rate_limiter.allow(client_ip):
             return SecurityDecision("BLOCK", "RATE_LIMIT", "RL-01", 7)
+
+        # 2. Region access control
+        if not is_destination_allowed(client_ip, ctx.host):
+            return SecurityDecision("BLOCK", "REGION_DENY", "REG-01", 8)
 
         # 2. IP reputation
         if self.reputation.is_ip_blocked(client_ip):
